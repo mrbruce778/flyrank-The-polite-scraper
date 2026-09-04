@@ -17,7 +17,10 @@ TIMEOUT_SECONDS = 10
 REQUEST_DELAY_SECONDS = 0.5
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+MAX_RETRIES = 1  # one retry, per spec ("wait a moment and try once more")
+RETRY_DELAY_SECONDS = 2
 
+_stats = {"fetched": 0, "cache_hits": 0}
 class BookRecord(BaseModel):
     title: str
     product_url: HttpUrl
@@ -43,13 +46,50 @@ def cache_filename_for_detail_page(url: str) -> Path:
 def fetch_page(url: str) -> str:
     """Politely fetch a page: honest user-agent, timeout, status check."""
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+    try:
+        response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+    except requests.exceptions.Timeout as exc:
+        raise TimeoutError(f"Timed out fetching {url}") from exc
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Fetch failed: status {response.status_code} for {url}")
+    if response.status_code == 200:
+        return response.text
 
-    return response.text
+    if response.status_code == 404:
+        raise FileNotFoundError(f"404 Not Found: {url}")
+    if response.status_code == 403:
+        raise PermissionError(f"403 Forbidden: {url}")
+    if 500 <= response.status_code < 600:
+        raise ConnectionError(f"Server error {response.status_code}: {url}")
 
+    raise RuntimeError(f"Unexpected status {response.status_code} for {url}")
+
+
+def get_page_with_retry(url: str, cache_path_fn) -> str:
+    """Fetch with cache; retry once on timeout/5xx only, never on 404/403."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_path_fn(url)
+
+    if cache_file.exists():
+        html = cache_file.read_text(encoding="utf-8")
+        print(f"CACHE HIT: {cache_file.name} ({len(html)} bytes)")
+        return html
+
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            html = fetch_page(url)
+            cache_file.write_text(html, encoding="utf-8")
+            print(f"FETCH: {url} -> {cache_file.name} ({len(html)} bytes)")
+            time.sleep(REQUEST_DELAY_SECONDS)
+            return html
+        except (TimeoutError, ConnectionError) as exc:
+            if attempts > MAX_RETRIES:
+                raise
+            print(f"RETRY ({attempts}/{MAX_RETRIES}): {url} -> {exc}")
+            time.sleep(RETRY_DELAY_SECONDS)
+        # FileNotFoundError (404) and PermissionError (403) are NOT caught here —
+        # they propagate immediately, no retry.
 
 def get_page(url: str, cache_path_fn=cache_filename_for) -> str:
     """Return page HTML from cache if present, else fetch, cache, and delay."""
@@ -66,7 +106,24 @@ def get_page(url: str, cache_path_fn=cache_filename_for) -> str:
     print(f"FETCH: {url} -> {cache_file.name} ({len(html)} bytes)")
     time.sleep(REQUEST_DELAY_SECONDS)
     return html
+def build_run_report(start_time, pages_fetched, cache_hits, valid_records, invalid_records, failed_pages) -> dict:
+    duration_seconds = (datetime.now(timezone.utc) - start_time).total_seconds()
+    return {
+        "start_time": start_time.isoformat(),
+        "duration_seconds": round(duration_seconds, 2),
+        "pages_fetched": pages_fetched,
+        "cache_hits": cache_hits,
+        "valid_records": len(valid_records),
+        "invalid_records": len(invalid_records),
+        "failed_pages": len(failed_pages),
+    }
 
+
+def store_run_report(report: dict) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = OUTPUT_DIR / "run-report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"run-report: {report}")
 def extract_book_links(html: str, page_url: str) -> list[str]:
     """Return absolute URLs for every book listed on a catalogue page."""
     soup = BeautifulSoup(html, "html.parser")
@@ -184,22 +241,46 @@ def store_records(valid_records: list[dict], invalid_records: list[dict]) -> Non
 
     print(f"stored: valid={len(valid_records)} invalid={len(invalid_records)}")
 
-def extract_all_book_records(book_urls: list[str]) -> list[dict]:
-    """Fetch every book detail page and extract its raw record."""
+def extract_all_book_records(book_urls: list[str]) -> tuple[list[dict], list[dict]]:
+    """Fetch every book detail page and extract its raw record.
+    Returns (records, failed_pages) — one bad page never stops the run.
+    """
     records = []
-    for url in book_urls:
-        html = get_page(url, cache_path_fn=cache_filename_for_detail_page)
-        record = extract_book_record(html, product_url=url, source_page=BASE_CATALOGUE_URL)
-        records.append(record)
+    failed_pages = []
 
-    print(f"detail_pages={len(records)}")
-    return records
+    for url in book_urls:
+        try:
+            html = get_page_with_retry(url, cache_path_fn=cache_filename_for_detail_page)
+            record = extract_book_record(html, product_url=url, source_page=BASE_CATALOGUE_URL)
+            records.append(record)
+        except Exception as exc:
+            print(f"FAILED: {url} -> {exc}")
+            failed_pages.append({"url": url, "reason": str(exc)})
+
+    print(f"detail_pages={len(records)} failed_pages={len(failed_pages)}")
+    return records, failed_pages
 
 def main() -> None:
+    start_time = datetime.now(timezone.utc)
+
     book_urls = discover_all_book_urls()
-    raw_records = extract_all_book_records(book_urls)
+
+    # Prove failure survival: add one fake URL on purpose
+    book_urls.append("https://books.toscrape.com/catalogue/this-book-does-not-exist_9999/index.html")
+
+    raw_records, failed_pages = extract_all_book_records(book_urls)
     valid_records, invalid_records = clean_and_validate_records(raw_records)
     store_records(valid_records, invalid_records)
+
+    report = build_run_report(
+        start_time,
+        pages_fetched=_stats["fetched"],
+        cache_hits=_stats["cache_hits"],
+        valid_records=valid_records,
+        invalid_records=invalid_records,
+        failed_pages=failed_pages,
+    )
+    store_run_report(report)
 
 
 if __name__ == "__main__":
