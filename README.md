@@ -62,9 +62,22 @@ Output appears in `output/books.json`, `output/errors.json`, and
 ## Sample run report
 
 ```json
-<paste your actual output/run-report.json content here>
+<{
+  "start_time": "2026-09-04T23:23:42.391225+00:00",
+  "duration_seconds": 1.68,
+  "pages_fetched": 0,
+  "cache_hits": 0,
+  "valid_records": 60,
+  "invalid_records": 0,
+  "failed_pages": 1
+}>
 ```
+## Why this assignment needed no browser
 
+The book data (title, price, availability, description) is already present
+in the HTML the server sends on first request — nothing is loaded
+dynamically via JavaScript, so a browser would only add cost (memory, CPU,
+and time) with no benefit here.
 ## Ethics note
 
 This scraper only touches a site explicitly built and offered for scraping
