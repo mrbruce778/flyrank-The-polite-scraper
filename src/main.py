@@ -3,7 +3,8 @@
 import time
 from pathlib import Path
 from urllib.parse import urljoin
-
+from datetime import datetime, timezone
+import hashlib
 import requests
 from bs4 import BeautifulSoup
 MAX_CATALOGUE_PAGES = 3
@@ -21,6 +22,10 @@ def cache_filename_for(url: str) -> Path:
     name = url.rstrip("/").split("/")[-1]
     return CACHE_DIR / f"catalogue-{name}"
 
+def cache_filename_for_detail_page(url: str) -> Path:
+    """Build a stable cache filename for a book detail page URL."""
+    slug = url.rstrip("/").split("/")[-2]  # e.g. 'a-light-in-the-attic_1000'
+    return CACHE_DIR / f"book-{slug}.html"
 
 def fetch_page(url: str) -> str:
     """Politely fetch a page: honest user-agent, timeout, status check."""
@@ -33,10 +38,10 @@ def fetch_page(url: str) -> str:
     return response.text
 
 
-def get_page(url: str) -> str:
+def get_page(url: str, cache_path_fn=cache_filename_for) -> str:
     """Return page HTML from cache if present, else fetch, cache, and delay."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_filename_for(url)
+    cache_file = cache_path_fn(url)
 
     if cache_file.exists():
         html = cache_file.read_text(encoding="utf-8")
@@ -46,9 +51,8 @@ def get_page(url: str) -> str:
     html = fetch_page(url)
     cache_file.write_text(html, encoding="utf-8")
     print(f"FETCH: {url} -> {cache_file.name} ({len(html)} bytes)")
-    time.sleep(REQUEST_DELAY_SECONDS)  # only real requests get delayed
+    time.sleep(REQUEST_DELAY_SECONDS)
     return html
-
 
 def extract_book_links(html: str, page_url: str) -> list[str]:
     """Return absolute URLs for every book listed on a catalogue page."""
@@ -91,10 +95,54 @@ def discover_all_book_urls() -> list[str]:
         f"unique_urls={len(unique_links)}"
     )
     return unique_links
+def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
+    """Pull the 8 raw fields out of a single book detail page."""
+    soup = BeautifulSoup(html, "html.parser")
 
+    title = soup.select_one("div.product_main h1").get_text(strip=True)
+
+    price_text = soup.select_one("p.price_color").get_text(strip=True)
+
+    availability_text = soup.select_one("p.availability").get_text(strip=True)
+
+    # Rating is stored as a CSS class, e.g. class="star-rating Three"
+    rating_tag = soup.select_one("p.star-rating")
+    rating_classes = rating_tag.get("class", []) if rating_tag else []
+    rating_text = next((c for c in rating_classes if c != "star-rating"), None)
+
+    # Not every book has a description
+    description_tag = soup.select_one("#product_description ~ p")
+    description = description_tag.get_text(strip=True) if description_tag else None
+
+    return {
+        "title": title,
+        "product_url": product_url,
+        "price_text": price_text,
+        "availability_text": availability_text,
+        "rating_text": rating_text,
+        "description": description,
+        "source_page": source_page,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def extract_all_book_records(book_urls: list[str]) -> list[dict]:
+    """Fetch every book detail page and extract its raw record."""
+    records = []
+    for url in book_urls:
+        html = get_page(url, cache_path_fn=cache_filename_for_detail_page)
+        record = extract_book_record(html, product_url=url, source_page=BASE_CATALOGUE_URL)
+        records.append(record)
+
+    print(f"detail_pages={len(records)}")
+    return records
 
 def main() -> None:
-    discover_all_book_urls()
+    book_urls = discover_all_book_urls()
+    records = extract_all_book_records(book_urls)
+
+    if records:
+        print(records[0])
 
 
 if __name__ == "__main__":
