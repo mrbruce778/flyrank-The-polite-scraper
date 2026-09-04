@@ -6,15 +6,28 @@ from urllib.parse import urljoin
 from datetime import datetime, timezone
 import hashlib
 import requests
+import json
+import re
+from pydantic import BaseModel, HttpUrl, ValidationError
 from bs4 import BeautifulSoup
 MAX_CATALOGUE_PAGES = 3
 BASE_CATALOGUE_URL = "https://books.toscrape.com/catalogue/page-1.html"
 USER_AGENT = "FlyRankInternshipA9/1.0 (+https://github.com/YOUR_USERNAME/YOUR_REPO)"
 TIMEOUT_SECONDS = 10
 REQUEST_DELAY_SECONDS = 0.5
-
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 
+class BookRecord(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_gbp: float
+    price_text: str
+    availability_text: str
+    rating_text: str | None
+    description: str | None
+    source_page: HttpUrl
+    fetched_at: str
 
 def cache_filename_for(url: str) -> Path:
     """Build a stable cache filename for a catalogue page URL."""
@@ -124,7 +137,52 @@ def extract_book_record(html: str, product_url: str, source_page: str) -> dict:
         "source_page": source_page,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+def parse_price_gbp(price_text: str) -> float:
+    """Turn '£51.77' into 51.77. Raises ValueError if no number is found."""
+    match = re.search(r"[\d.]+", price_text)
+    if not match:
+        raise ValueError(f"Could not parse a number out of price_text: {price_text!r}")
+    return float(match.group())
 
+
+def clean_and_validate_records(raw_records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Normalize raw records, validate against the schema, split good vs bad."""
+    valid_records: list[dict] = []
+    invalid_records: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for raw in raw_records:
+        try:
+            price_gbp = parse_price_gbp(raw["price_text"])
+
+            candidate = {**raw, "price_gbp": price_gbp}
+            validated = BookRecord(**candidate)
+
+            canonical_url = str(validated.product_url)
+            if canonical_url in seen_urls:
+                continue  # duplicate — skip silently, canonical URL already stored
+            seen_urls.add(canonical_url)
+
+            # model_dump with str URLs so json.dump doesn't choke on HttpUrl objects
+            record_dict = json.loads(validated.model_dump_json())
+            valid_records.append(record_dict)
+
+        except (ValidationError, ValueError, KeyError) as exc:
+            invalid_records.append({"record": raw, "reason": str(exc)})
+
+    return valid_records, invalid_records
+
+
+def store_records(valid_records: list[dict], invalid_records: list[dict]) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    books_path = OUTPUT_DIR / "books.json"
+    errors_path = OUTPUT_DIR / "errors.json"
+
+    books_path.write_text(json.dumps(valid_records, indent=2), encoding="utf-8")
+    errors_path.write_text(json.dumps(invalid_records, indent=2), encoding="utf-8")
+
+    print(f"stored: valid={len(valid_records)} invalid={len(invalid_records)}")
 
 def extract_all_book_records(book_urls: list[str]) -> list[dict]:
     """Fetch every book detail page and extract its raw record."""
@@ -139,10 +197,9 @@ def extract_all_book_records(book_urls: list[str]) -> list[dict]:
 
 def main() -> None:
     book_urls = discover_all_book_urls()
-    records = extract_all_book_records(book_urls)
-
-    if records:
-        print(records[0])
+    raw_records = extract_all_book_records(book_urls)
+    valid_records, invalid_records = clean_and_validate_records(raw_records)
+    store_records(valid_records, invalid_records)
 
 
 if __name__ == "__main__":
